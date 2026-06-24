@@ -235,6 +235,8 @@ class Latte(nn.Module):
 
         if self.extras == 2:
             self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        if self.extras == 3:
+            self.cond_embedder = PatchEmbed(input_size, patch_size, 1, hidden_size, bias=True)
         if self.extras == 78: # timestep + text_embedding
             self.text_embedding_projection = nn.Sequential(
             nn.SiLU(),
@@ -278,6 +280,10 @@ class Latte(nn.Module):
         if self.extras == 2:
             # Initialize label embedding table:
             nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        if self.extras == 3:
+            w = self.cond_embedder.proj.weight.data
+            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+            nn.init.constant_(self.cond_embedder.proj.bias, 0)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -315,6 +321,7 @@ class Latte(nn.Module):
                 x, 
                 t, 
                 y=None, 
+                condition=None,
                 text_embedding=None, 
                 use_fp16=False):
         """
@@ -329,6 +336,13 @@ class Latte(nn.Module):
         batches, frames, channels, high, weight = x.shape 
         x = rearrange(x, 'b f c h w -> (b f) c h w')
         x = self.x_embedder(x) + self.pos_embed  
+        if self.extras == 3:
+            if condition is None:
+                raise ValueError("Latte building-conditioned training requires condition.")
+            if use_fp16:
+                condition = condition.to(dtype=torch.float16)
+            condition = rearrange(condition, 'b f c h w -> (b f) c h w')
+            x = x + self.cond_embedder(condition)
         t = self.t_embedder(t, use_fp16=use_fp16)                  
         timestep_spatial = repeat(t, 'n d -> (n c) d', c=self.temp_embed.shape[1]) 
         timestep_temp = repeat(t, 'n d -> (n c) d', c=self.pos_embed.shape[1])
@@ -376,7 +390,7 @@ class Latte(nn.Module):
         x = rearrange(x, '(b f) c h w -> b f c h w', b=batches)
         return x
 
-    def forward_with_cfg(self, x, t, y=None, cfg_scale=7.0, use_fp16=False, text_embedding=None):
+    def forward_with_cfg(self, x, t, y=None, cfg_scale=7.0, use_fp16=False, text_embedding=None, condition=None):
         """
         Forward pass of Latte, but also batches the unconditional forward pass for classifier-free guidance.
         """
@@ -385,7 +399,7 @@ class Latte(nn.Module):
         combined = torch.cat([half, half], dim=0)
         if use_fp16:
             combined = combined.to(dtype=torch.float16)
-        model_out = self.forward(combined, t, y=y, use_fp16=use_fp16, text_embedding=text_embedding)
+        model_out = self.forward(combined, t, y=y, use_fp16=use_fp16, text_embedding=text_embedding, condition=condition)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.

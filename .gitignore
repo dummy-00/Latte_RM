@@ -3,6 +3,8 @@ preprocess
 results
 results_img
 sample_videos
+logs/
+pretrained/
 
 
 __pycache__/

@@ -8,6 +8,7 @@ from .ffs_image_datasets import FaceForensicsImages
 from .sky_image_datasets import SkyImages
 from .ucf101_image_datasets import UCF101Images
 from .taichi_image_datasets import TaichiImages
+from .plj_datasets import PLJ
 
 
 def get_dataset(args):
@@ -75,5 +76,12 @@ def get_dataset(args):
                     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
             ])
         return SkyImages(args, transform=transform_sky, temporal_sample=temporal_sample)
+    elif args.dataset == 'plj':
+        transform_plj = transforms.Compose([
+                    video_transforms.ToTensorVideo(),
+                    video_transforms.CenterCropResizeVideo(args.image_size),
+                    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+            ])
+        return PLJ(args, transform=transform_plj, temporal_sample=temporal_sample)
     else:
         raise NotImplementedError(args.dataset)

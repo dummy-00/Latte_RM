@@ -17,6 +17,7 @@ import io
 import os
 import math
 import argparse
+import imageio
 
 import torch.distributed as dist
 from glob import glob
@@ -38,7 +39,87 @@ from utils import (clip_grad_norm_, create_logger, update_ema,
                    write_tensorboard, setup_distributed,
                    get_experiment_dir, text_preprocessing)
 import numpy as np
+import torch.nn.functional as F
 from transformers import T5EncoderModel, T5Tokenizer
+
+def load_vae(pretrained_model_path, device):
+    if os.path.isdir(pretrained_model_path):
+        if os.path.exists(os.path.join(pretrained_model_path, "vae", "config.json")):
+            return AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae").to(device)
+        return AutoencoderKL.from_pretrained(pretrained_model_path).to(device)
+    return AutoencoderKL.from_pretrained(pretrained_model_path).to(device)
+
+
+def save_video(path, video, fps=8):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    video = ((video * 0.5 + 0.5) * 255).add_(0.5).clamp_(0, 255)
+    video = video.to(dtype=torch.uint8).detach().cpu().permute(0, 2, 3, 1).contiguous()
+    imageio.mimwrite(path, video, fps=fps, quality=9)
+
+
+def save_condition_video(path, condition, fps=8):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    condition = condition.detach().cpu().clamp(0, 1)
+    condition = condition.repeat(1, 3, 1, 1)
+    video = (condition * 255).add_(0.5).to(dtype=torch.uint8).permute(0, 2, 3, 1).contiguous()
+    imageio.mimwrite(path, video, fps=fps, quality=9)
+
+
+@torch.no_grad()
+def save_training_preview(args, preview_model, vae, diffusion, video_data, train_steps, preview_dir, device):
+    was_training = preview_model.training
+    preview_model.eval()
+    condition = video_data.get("condition")
+    if condition is None:
+        model_kwargs = dict(y=None)
+    else:
+        condition = condition[:1].to(device, non_blocking=True)
+        cond_latent = F.interpolate(
+            condition.flatten(0, 1),
+            size=(args.latent_size, args.latent_size),
+            mode="nearest",
+        )
+        cond_latent = cond_latent.unflatten(0, (1, args.num_frames)).contiguous()
+        model_kwargs = dict(condition=cond_latent)
+        save_condition_video(
+            os.path.join(preview_dir, f"step{train_steps:07d}_condition.mp4"),
+            condition[0],
+        )
+
+    real_video = video_data["video"][:1].to(device, non_blocking=True)
+    save_video(
+        os.path.join(preview_dir, f"step{train_steps:07d}_real.mp4"),
+        real_video[0],
+    )
+    b, f, c, h, w = real_video.shape
+    recon = rearrange(real_video, "b f c h w -> (b f) c h w")
+    recon = vae.decode(vae.encode(recon).latent_dist.sample().mul_(0.18215) / 0.18215).sample
+    recon = rearrange(recon, "(b f) c h w -> b f c h w", b=b)
+    save_video(
+        os.path.join(preview_dir, f"step{train_steps:07d}_vae_recon.mp4"),
+        recon[0],
+    )
+
+    z = torch.randn(1, args.num_frames, 4, args.latent_size, args.latent_size, device=device)
+    sample_diffusion = create_diffusion(str(getattr(args, "vis_sampling_steps", 50)))
+    samples = sample_diffusion.ddim_sample_loop(
+        preview_model,
+        z.shape,
+        z,
+        clip_denoised=False,
+        model_kwargs=model_kwargs,
+        progress=False,
+        device=device,
+    )
+    b, f, c, h, w = samples.shape
+    samples = rearrange(samples, "b f c h w -> (b f) c h w")
+    samples = vae.decode(samples / 0.18215).sample
+    samples = rearrange(samples, "(b f) c h w -> b f c h w", b=b)
+    save_video(
+        os.path.join(preview_dir, f"step{train_steps:07d}_sample.mp4"),
+        samples[0],
+    )
+    preview_model.train(was_training)
 
 #################################################################################
 #                                  Training Loop                                #
@@ -74,7 +155,9 @@ def main(args):
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}-{num_frame_string}-{args.dataset}"  # Create an experiment folder
         experiment_dir = get_experiment_dir(experiment_dir, args)
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+        preview_dir = f"{experiment_dir}/previews"
         os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(preview_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         tb_writer = create_tensorboard(experiment_dir)
         OmegaConf.save(args, os.path.join(experiment_dir, 'config.yaml'))
@@ -82,6 +165,7 @@ def main(args):
     else:
         logger = create_logger(None)
         tb_writer = None
+        preview_dir = None
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -90,8 +174,7 @@ def main(args):
     model = get_models(args)
     
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_path, subfolder="vae").to(device)
+    vae = load_vae(args.pretrained_model_path, device)
 
     # # use pretrained model?
     if args.pretrained:
@@ -147,7 +230,9 @@ def main(args):
         sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
     logger.info(f"Dataset contains {len(dataset):,} videos ({args.data_path})")
 
@@ -214,6 +299,15 @@ def main(args):
                 raise 'T2V training are Not supported at this moment!'
             elif args.extras == 2:
                 model_kwargs = dict(y=video_name)
+            elif args.extras == 3:
+                condition = video_data['condition'].to(device, non_blocking=True)
+                condition = F.interpolate(
+                    condition.flatten(0, 1),
+                    size=(args.latent_size, args.latent_size),
+                    mode="nearest",
+                )
+                condition = condition.unflatten(0, (b, args.num_frames)).contiguous()
+                model_kwargs = dict(condition=condition)
             else:
                 model_kwargs = dict(y=None)
 
@@ -255,6 +349,13 @@ def main(args):
                 running_loss = 0
                 log_steps = 0
                 start_time = time()
+
+            if getattr(args, "sample_every", 0) and train_steps % args.sample_every == 0 and train_steps > 0:
+                if rank == 0:
+                    preview_model = ema if getattr(args, "preview_use_ema", False) else model.module
+                    save_training_preview(args, preview_model, vae, diffusion, video_data, train_steps, preview_dir, device)
+                    logger.info(f"Saved training preview to {preview_dir}")
+                dist.barrier()
 
             # Save Latte checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
