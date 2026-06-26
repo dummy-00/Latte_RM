@@ -45,7 +45,8 @@ def get_models(args):
                 num_classes=args.num_classes,
                 num_frames=args.num_frames,
                 learn_sigma=args.learn_sigma,
-                extras=args.extras
+                extras=args.extras,
+                cond_channels=getattr(args, "cond_channels", 1),
             )
     else:
         raise '{} Model Not Supported!'.format(args.model)

@@ -219,6 +219,7 @@ class Latte(nn.Module):
         num_classes=1000,
         learn_sigma=True,
         extras=1,
+        cond_channels=1,
         attention_mode='math',
     ):
         super().__init__()
@@ -228,6 +229,7 @@ class Latte(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.extras = extras
+        self.cond_channels = cond_channels
         self.num_frames = num_frames
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
@@ -236,7 +238,7 @@ class Latte(nn.Module):
         if self.extras == 2:
             self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         if self.extras == 3:
-            self.cond_embedder = PatchEmbed(input_size, patch_size, 1, hidden_size, bias=True)
+            self.cond_embedder = PatchEmbed(input_size, patch_size, cond_channels, hidden_size, bias=True)
         if self.extras == 78: # timestep + text_embedding
             self.text_embedding_projection = nn.Sequential(
             nn.SiLU(),

@@ -60,7 +60,13 @@ def save_video(path, video, fps=8):
 def save_condition_video(path, condition, fps=8):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     condition = condition.detach().cpu().clamp(0, 1)
-    condition = condition.repeat(1, 3, 1, 1)
+    if condition.size(1) == 1:
+        condition = condition.repeat(1, 3, 1, 1)
+    elif condition.size(1) == 2:
+        zeros = torch.zeros_like(condition[:, :1])
+        condition = torch.cat([condition, zeros], dim=1)
+    elif condition.size(1) > 3:
+        condition = condition[:, :3]
     video = (condition * 255).add_(0.5).to(dtype=torch.uint8).permute(0, 2, 3, 1).contiguous()
     imageio.mimwrite(path, video, fps=fps, quality=9)
 

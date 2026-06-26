@@ -33,6 +33,7 @@ class PLJ(data.Dataset):
         self.target_video_len = configs.num_frames
         self.frame_interval = configs.frame_interval
         self.condition_root = getattr(configs, "condition_root", None)
+        self.view_condition_root = getattr(configs, "view_condition_root", None)
         self.use_condition = bool(getattr(configs, "use_condition", False))
         self.data_all = self.load_video_frames(self.data_path)
 
@@ -59,7 +60,7 @@ class PLJ(data.Dataset):
         video_clip = self.transform(video_clip)
         item = {"video": video_clip, "video_name": 1}
         if self.use_condition:
-            item["condition"] = self.render_building_condition(select_video_frames)
+            item["condition"] = self.render_condition(select_video_frames)
         return item
 
     def __len__(self):
@@ -93,6 +94,14 @@ class PLJ(data.Dataset):
         digits = "".join(ch for ch in stem if ch.isdigit())
         return int(digits) if digits else fallback
 
+    def render_condition(self, frame_paths):
+        building_condition = self.render_building_condition(frame_paths)
+        if self.view_condition_root is None:
+            return building_condition
+
+        view_condition = self.load_view_condition(frame_paths)
+        return torch.cat([building_condition, view_condition], dim=1)
+
     def render_building_condition(self, frame_paths):
         if self.condition_root is None:
             raise ValueError("PLJ condition is enabled, but condition_root is not set.")
@@ -117,3 +126,21 @@ class PLJ(data.Dataset):
 
         condition = torch.cat(frames, dim=0).float() / 255.0
         return condition
+
+    def load_view_condition(self, frame_paths):
+        clip_name = os.path.basename(os.path.dirname(frame_paths[0]))
+        view_dir = os.path.join(self.view_condition_root, clip_name)
+        if not os.path.isdir(view_dir):
+            raise FileNotFoundError(f"Missing PLJ view condition directory: {view_dir}")
+
+        frames = []
+        for i, frame_path in enumerate(frame_paths):
+            height_idx = self.height_index_from_frame_name(frame_path, i + 1)
+            path = os.path.join(view_dir, f"h{height_idx}.png")
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"Missing PLJ view condition frame: {path}")
+            with Image.open(path) as img:
+                frame = torch.as_tensor(np.array(img.convert("L"), dtype=np.uint8, copy=True))
+            frames.append(frame.unsqueeze(0).unsqueeze(0))
+
+        return torch.cat(frames, dim=0).float() / 255.0
